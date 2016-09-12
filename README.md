@@ -1,6 +1,6 @@
 # Continue Class Patch
 
-This patch introduces new syntax into python to address issues with, and clarify the process of, extending a class after the initial declaration. The following both shows the new syntax and provides a test for the patch.
+This patch introduces new syntax into python to address issues with, and clarify the process of, extending a class after the initial declaration. The patch is built against, and is designed for, python 3.5. The following both shows the new syntax and provides a test for the patch.
 
 ```python
 # Define a class Foo, taking a message as an argument
