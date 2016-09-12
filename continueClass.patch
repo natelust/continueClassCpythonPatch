@@ -1,0 +1,396 @@
+diff -r ff3a6303c5b1 Grammar/Grammar
+--- a/Grammar/Grammar	Wed Aug 31 21:03:16 2016 -0400
++++ b/Grammar/Grammar	Sat Sep 10 22:25:26 2016 -0500
+@@ -36,7 +36,7 @@
+      |  '*' [vfpdef] (',' vfpdef ['=' test])* [',' '**' vfpdef] | '**' vfpdef)
+ vfpdef: NAME
+
+-stmt: simple_stmt | compound_stmt
++stmt: compound_stmt | simple_stmt
+ simple_stmt: small_stmt (';' small_stmt)* [';'] NEWLINE
+ small_stmt: (expr_stmt | del_stmt | pass_stmt | flow_stmt |
+              import_stmt | global_stmt | nonlocal_stmt | assert_stmt)
+@@ -68,7 +68,7 @@
+ nonlocal_stmt: 'nonlocal' NAME (',' NAME)*
+ assert_stmt: 'assert' test [',' test]
+
+-compound_stmt: if_stmt | while_stmt | for_stmt | try_stmt | with_stmt | funcdef | classdef | decorated | async_stmt
++compound_stmt: if_stmt | while_stmt | for_stmt | try_stmt | with_stmt | funcdef | classdef| conclassdef | decorated | async_stmt
+ async_stmt: ASYNC (funcdef | with_stmt | for_stmt)
+ if_stmt: 'if' test ':' suite ('elif' test ':' suite)* ['else' ':' suite]
+ while_stmt: 'while' test ':' suite ['else' ':' suite]
+@@ -123,6 +123,8 @@
+
+ classdef: 'class' NAME ['(' [arglist] ')'] ':' suite
+
++conclassdef: 'continue' 'class' NAME ':' suite
++
+ arglist: argument (',' argument)*  [',']
+
+ # The reason that keywords are test nodes instead of NAME is that using NAME
+diff -r ff3a6303c5b1 Include/Python-ast.h
+--- a/Include/Python-ast.h	Wed Aug 31 21:03:16 2016 -0400
++++ b/Include/Python-ast.h	Sat Sep 10 22:25:26 2016 -0500
+@@ -64,12 +64,13 @@
+ };
+
+ enum _stmt_kind {FunctionDef_kind=1, AsyncFunctionDef_kind=2, ClassDef_kind=3,
+-                  Return_kind=4, Delete_kind=5, Assign_kind=6,
+-                  AugAssign_kind=7, For_kind=8, AsyncFor_kind=9, While_kind=10,
+-                  If_kind=11, With_kind=12, AsyncWith_kind=13, Raise_kind=14,
+-                  Try_kind=15, Assert_kind=16, Import_kind=17,
+-                  ImportFrom_kind=18, Global_kind=19, Nonlocal_kind=20,
+-                  Expr_kind=21, Pass_kind=22, Break_kind=23, Continue_kind=24};
++                  Return_kind=4, ConClassDef_kind=5, Delete_kind=6,
++                  Assign_kind=7, AugAssign_kind=8, For_kind=9,
++                  AsyncFor_kind=10, While_kind=11, If_kind=12, With_kind=13,
++                  AsyncWith_kind=14, Raise_kind=15, Try_kind=16,
++                  Assert_kind=17, Import_kind=18, ImportFrom_kind=19,
++                  Global_kind=20, Nonlocal_kind=21, Expr_kind=22, Pass_kind=23,
++                  Break_kind=24, Continue_kind=25};
+ struct _stmt {
+     enum _stmt_kind kind;
+     union {
+@@ -102,6 +103,11 @@
+         } Return;
+
+         struct {
++            identifier name;
++            asdl_seq *body;
++        } ConClassDef;
++
++        struct {
+             asdl_seq *targets;
+         } Delete;
+
+@@ -437,6 +443,9 @@
+                      int col_offset, PyArena *arena);
+ #define Return(a0, a1, a2, a3) _Py_Return(a0, a1, a2, a3)
+ stmt_ty _Py_Return(expr_ty value, int lineno, int col_offset, PyArena *arena);
++#define ConClassDef(a0, a1, a2, a3, a4) _Py_ConClassDef(a0, a1, a2, a3, a4)
++stmt_ty _Py_ConClassDef(identifier name, asdl_seq * body, int lineno, int
++                        col_offset, PyArena *arena);
+ #define Delete(a0, a1, a2, a3) _Py_Delete(a0, a1, a2, a3)
+ stmt_ty _Py_Delete(asdl_seq * targets, int lineno, int col_offset, PyArena
+                    *arena);
+diff -r ff3a6303c5b1 Parser/Python.asdl
+--- a/Parser/Python.asdl	Wed Aug 31 21:03:16 2016 -0400
++++ b/Parser/Python.asdl	Sat Sep 10 22:25:26 2016 -0500
+@@ -21,6 +21,9 @@
+              expr* decorator_list)
+           | Return(expr? value)
+
++          | ConClassDef(identifier name,
++             stmt* body)
++
+           | Delete(expr* targets)
+           | Assign(expr* targets, expr value)
+           | AugAssign(expr target, operator op, expr value)
+diff -r ff3a6303c5b1 Python/ast.c
+--- a/Python/ast.c	Wed Aug 31 21:03:16 2016 -0400
++++ b/Python/ast.c	Sat Sep 10 22:25:26 2016 -0500
+@@ -325,6 +325,10 @@
+             validate_exprs(stmt->v.ClassDef.bases, Load, 0) &&
+             validate_keywords(stmt->v.ClassDef.keywords) &&
+             validate_exprs(stmt->v.ClassDef.decorator_list, Load, 0);
++    case ConClassDef_kind:
++        {
++        return validate_body(stmt->v.ConClassDef.body, "ConClassDef");
++    }
+     case Return_kind:
+         return !stmt->v.Return.value || validate_expr(stmt->v.Return.value, Load);
+     case Delete_kind:
+@@ -527,6 +531,7 @@
+                                   expr_context_ty);
+ static expr_ty ast_for_testlist(struct compiling *, const node *);
+ static stmt_ty ast_for_classdef(struct compiling *, const node *, asdl_seq *);
++static stmt_ty ast_for_conclassdef(struct compiling *, const node *);
+
+ static stmt_ty ast_for_with_stmt(struct compiling *, const node *, int);
+ static stmt_ty ast_for_for_stmt(struct compiling *, const node *, int);
+@@ -3807,6 +3812,41 @@
+ }
+
+ static stmt_ty
++ast_for_conclassdef(struct compiling *c, const node *n)
++{
++    /* conclassdef: 'continue' 'class' NAME ':' */
++    PyObject *classname;
++    asdl_seq *s;
++    expr_ty call;
++
++    REQ(n, conclassdef);
++
++    if(NCH(n) == 5) {
++    s = ast_for_suite(c, CHILD(n, 4));
++    if (!s)
++        {
++        PyErr_Format(PyExc_SystemError, "problem with body");
++        return NULL;
++    }
++    classname = NEW_IDENTIFIER(CHILD(n, 2));
++    if (!classname)
++        {
++        PyErr_Format(PyExc_SystemError, "problem with classname");
++        return NULL;
++    }
++    if (forbidden_name(c, classname, CHILD(n, 2), 0))
++        {
++        PyErr_Format(PyExc_SystemError, "forbidden name");
++        return NULL;
++    }
++    return ConClassDef(classname, s, LINENO(n), n->n_col_offset, c->c_arena);
++    }
++
++    PyErr_Format(PyExc_SystemError, "Problem parsing continue class");
++    return NULL;
++}
++
++static stmt_ty
+ ast_for_stmt(struct compiling *c, const node *n)
+ {
+     if (TYPE(n) == stmt) {
+@@ -3848,7 +3888,7 @@
+     }
+     else {
+         /* compound_stmt: if_stmt | while_stmt | for_stmt | try_stmt
+-                        | funcdef | classdef | decorated | async_stmt
++                        | funcdef | classdef | conclassdef| decorated | async_stmt
+         */
+         node *ch = CHILD(n, 0);
+         REQ(n, compound_stmt);
+@@ -3867,6 +3907,8 @@
+                 return ast_for_funcdef(c, ch, NULL);
+             case classdef:
+                 return ast_for_classdef(c, ch, NULL);
++            case conclassdef:
++                return ast_for_conclassdef(c, ch);
+             case decorated:
+                 return ast_for_decorated(c, ch);
+             case async_stmt:
+diff -r ff3a6303c5b1 Python/bltinmodule.c
+--- a/Python/bltinmodule.c	Wed Aug 31 21:03:16 2016 -0400
++++ b/Python/bltinmodule.c	Sat Sep 10 22:25:26 2016 -0500
+@@ -48,6 +48,76 @@
+
+ #include "clinic/bltinmodule.c.h"
+
++static PyObject *
++builtin__continue_class__(PyObject * self, PyObject *args)
++{
++    PyObject *cell ;
++    PyObject *aclass, *newdict;
++    PyObject *co, *dictkeys, *key, *item;
++    Py_ssize_t nargs, dict_size, i;
++
++    /* Assure the args object is not null, and is of type tuple*/
++    assert(args != NULL);
++    if (!PyTuple_Check(args)) {
++        PyErr_SetString(PyExc_TypeError,
++                        "__continue_class__: args is not a tuple");
++        return NULL;
++    }
++
++    /* Verify the function was passed the correct number of arguments */
++    nargs = PyTuple_GET_SIZE(args);
++    if (nargs < 2) {
++      PyErr_SetString(PyExc_TypeError,
++                      "__build_class__: not enough arguments");
++      return NULL;
++    }
++
++    /* Check that the first argumnet is a class */
++    aclass = PyTuple_GET_ITEM(args, 0);
++    if (!PyObject_IsInstance(aclass, (PyObject *)&PyType_Type)){
++      PyErr_SetString(PyExc_TypeError, "First aurgument must be a class");
++      return NULL;
++    }
++
++    /* Check that the second argument is a code object */
++    co = PyTuple_GET_ITEM(args, 1);
++    if (!PyCode_Check(co)){
++      PyErr_SetString(PyExc_TypeError,
++                      "Second argument must be a class body code object");
++      return NULL;
++    }
++
++    /* Create a dict to be the temporary namespace for the eval function */
++    newdict = PyDict_New();
++
++    /* Evalue the code object supplied in the function call*/
++    cell = PyEval_EvalCode(co, PyEval_GetGlobals(), newdict);
++
++    /* Iterate over the dictionary which was populated in the eval call.
++       Set an attribute in the class corresponding to the key, item pair
++       generated by the eval statement */
++    dict_size = PyDict_Size(newdict);
++    dictkeys = PyDict_Keys(newdict);
++    for (i = 0; i < dict_size; i++ ){
++        key = PyList_GetItem(dictkeys, i);
++        item = PyDict_GetItem(newdict, key);
++        PyObject_SetAttr(aclass, key, item);
++    }
++    /* Lower the reference count on the variables created XXX I am prety sure
++       each of these needs to be reduced, double check that this wont cause
++       garbage collection of a needed object */
++    Py_DECREF(newdict);
++    Py_DECREF(dictkeys);
++    Py_DECREF(cell);
++
++    /* A call to the __continue_class__ function should return none, as all the
++       work is done to the body of the class to be continued */
++    return Py_BuildValue("");
++}
++PyDoc_STRVAR(continue_class_doc,
++"__continue_class__: Internal helper function to continue the definition of a \
++class");
++
+ /* AC: cannot convert yet, waiting for *args support */
+ static PyObject *
+ builtin___build_class__(PyObject *self, PyObject *args, PyObject *kwds)
+@@ -2584,6 +2654,8 @@
+ static PyMethodDef builtin_methods[] = {
+     {"__build_class__", (PyCFunction)builtin___build_class__,
+      METH_VARARGS | METH_KEYWORDS, build_class_doc},
++    {"__continue_class__", (PyCFunction)builtin__continue_class__,
++    METH_VARARGS, continue_class_doc},
+     {"__import__",      (PyCFunction)builtin___import__, METH_VARARGS | METH_KEYWORDS, import_doc},
+     BUILTIN_ABS_METHODDEF
+     BUILTIN_ALL_METHODDEF
+diff -r ff3a6303c5b1 Python/compile.c
+--- a/Python/compile.c	Wed Aug 31 21:03:16 2016 -0400
++++ b/Python/compile.c	Sat Sep 10 22:25:26 2016 -0500
+@@ -1850,6 +1850,85 @@
+ }
+
+ static int
++compiler_conclass(struct compiler *c, stmt_ty s)
++{
++    PyCodeObject *co;
++    PyObject *str;
++    asdl_seq *stmts;
++    int i, j;
++    /* Load the continue class builtin function onto the stack */
++    str = PyUnicode_InternFromString("__continue_class__");
++    ADDOP_O(c, LOAD_GLOBAL, str, names);
++    Py_XDECREF(str);
++    /* Load the class to be continued onto the stack */
++    ADDOP_O(c, LOAD_NAME, s->v.ConClassDef.name, names);
++
++    /* compile the body into a code object */
++    if (!compiler_enter_scope(c, s->v.ConClassDef.name,
++                              COMPILER_SCOPE_CLASS, (void *)s, s->lineno))
++        return 0;
++    /* this block represents what we do in the new scope */
++    {
++        /* Get the qualified name for the class */
++        assert(c->u->u_qualname);
++        ADDOP_O(c, LOAD_CONST, c->u->u_qualname, consts);
++        str = PyUnicode_InternFromString("__qualname__");
++        if (!str || !compiler_nameop(c, str, Store)) {
++            Py_XDECREF(str);
++            compiler_exit_scope(c);
++            return 0;
++        }
++        Py_DECREF(str);
++
++        /* Parse the body block into statements */
++        stmts = s->v.ConClassDef.body;
++        for (j=0; j < asdl_seq_LEN(stmts); j++){
++            VISIT(c, stmt, (stmt_ty)asdl_seq_GET(stmts, j));
++        }
++        /* XXX I am not sure if this is needed to simply continue the class
++        I think it will never be triggerd because I am short circuting the
++        body parser above */
++        if (c->u->u_ste->ste_needs_class_closure) {
++            /* return the (empty) __class__ cell */
++            str = PyUnicode_InternFromString("__class__");
++            if (str == NULL) {
++                compiler_exit_scope(c);
++                return 0;
++            }
++            i = compiler_lookup_arg(c->u->u_cellvars, str);
++            Py_DECREF(str);
++            if (i < 0) {
++                compiler_exit_scope(c);
++                return 0;
++            }
++            assert(i == 0);
++            /* Return the cell where to store the statements*/
++            ADDOP_I(c, LOAD_CLOSURE, i);
++        }
++        else {
++            assert(PyDict_Size(c->u->u_cellvars) == 0);
++            /* This happens when nobody references the cell. Return None. */
++            ADDOP_O(c, LOAD_CONST, Py_None, consts);
++        }
++        ADDOP_IN_SCOPE(c, RETURN_VALUE);
++        /* create the code object */
++        co = assemble(c, 1);
++    }
++    /* leave the new scope */
++    compiler_exit_scope(c);
++    if (co == NULL)
++        return 0;
++
++    /* Load the code object representing the body of the continue class */
++    ADDOP_O(c, LOAD_CONST, (PyObject*)co, consts);
++    /* Call the __continue_class__ function with the class to continue and
++    the code object to evaluate */
++    ADDOP_I(c, CALL_FUNCTION, 2)
++    Py_DECREF(co);
++    return 1;
++}
++
++static int
+ compiler_ifexp(struct compiler *c, expr_ty e)
+ {
+     basicblock *end, *next;
+@@ -2613,6 +2692,8 @@
+         return compiler_function(c, s, 0);
+     case ClassDef_kind:
+         return compiler_class(c, s);
++    case ConClassDef_kind:
++        return compiler_conclass(c, s);
+     case Return_kind:
+         if (c->u->u_ste->ste_type != FunctionBlock)
+             return compiler_error(c, "'return' outside function");
+@@ -4749,4 +4830,3 @@
+ {
+     return PyAST_CompileEx(mod, filename, flags, -1, arena);
+ }
+-
+diff -r ff3a6303c5b1 Python/symtable.c
+--- a/Python/symtable.c	Wed Aug 31 21:03:16 2016 -0400
++++ b/Python/symtable.c	Sat Sep 10 22:25:26 2016 -0500
+@@ -378,7 +378,7 @@
+                                        PyLong_AsLong(PyTuple_GET_ITEM(data, 2)));
+
+             return 0;
+-        }
++        }
+     }
+     PyErr_SetString(PyExc_RuntimeError,
+                     "BUG: internal directive bookkeeping broken");
+@@ -1188,6 +1188,21 @@
+             VISIT_QUIT(st, 0);
+         break;
+     }
++    case ConClassDef_kind: {
++        PyObject *tmp;
++        if (!symtable_add_def(st, s->v.ConClassDef.name, DEF_LOCAL))
++            VISIT_QUIT(st, 0);
++        if (!symtable_enter_block(st, s->v.ConClassDef.name, ClassBlock,
++                                  (void *)s, s->lineno, s->col_offset))
++            VISIT_QUIT(st, 0);
++        tmp = st->st_private;
++        st->st_private = s->v.ConClassDef.name;
++        VISIT_SEQ(st, stmt, s->v.ConClassDef.body);
++        st->st_private = tmp;
++        if (!symtable_exit_block(st, s))
++            VISIT_QUIT(st, 0);
++        break;
++    }
+     case Return_kind:
+         if (s->v.Return.value) {
+             VISIT(st, expr, s->v.Return.value);
